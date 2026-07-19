@@ -20,6 +20,32 @@ report issues):
 When no agent session is active, the light is released back to normal.
 With several sessions at once, priority is: error > waiting > running > stopped.
 
+## Install
+
+**Windows** — open PowerShell and run:
+
+```powershell
+git clone https://github.com/mrfandu1/EnLight.git
+cd EnLight
+install.cmd
+```
+
+**macOS** — open Terminal and run:
+
+```bash
+git clone https://github.com/mrfandu1/EnLight.git
+cd EnLight
+./install.sh
+```
+
+That's it — Claude Code, Codex, and Cursor get wired up automatically.
+Restart any open Claude Code sessions afterward so the hooks load.
+RGB keyboard? Also install [OpenRGB](https://openrgb.org) for full color
+support. macOS: grant **Input Monitoring** to Python/Terminal if the light
+stays dark (System Settings → Privacy & Security).
+
+To remove everything later: `python installer.py --uninstall`
+
 ## Light flow
 
 One cycle = 2 seconds, in 8 steps of 250 ms (`█` on, `░` off), repeating
@@ -108,45 +134,6 @@ for "needs you now".
   (edit `codex_notify_chain.json` if the Codex runtime path changes).
 - `agent-run.cmd <any command>` — wraps any CLI agent: running while it runs,
   solid error for 15 s if it exits non-zero.
-
-## Install
-
-1. Copy this folder anywhere.
-2. **Windows:** double-click `install.cmd` — if Python isn't on the PC, the
-   installer downloads it automatically (via winget; on very old Windows
-   without winget it opens python.org and asks you to re-run).
-   **macOS:** run `./install.sh` in Terminal, then grant **Input
-   Monitoring** to Python/Terminal if the light stays dark
-   (System Settings → Privacy & Security).
-
-The installer does all the wiring automatically:
-- Claude Code hooks merged into `~/.claude/settings.json`
-  (existing settings untouched, backup written first; re-running the
-  installer is safe and also fixes paths after moving the folder)
-- Codex `notify` chained in `~/.codex/config.toml`, preserving whatever
-  notify program was already configured. The Codex app sometimes rewrites
-  its config and drops the chain; the daemon detects this and re-chains
-  automatically (within ~5 minutes of any agent activity)
-- Cursor hooks merged into `~/.cursor/hooks.json` (if Cursor is installed)
-- a periodic trigger task (Task Scheduler / launchd, every 2 min,
-  invisible `pythonw`) that starts the daemon only while an agent app is
-  actually open — nothing runs at boot, and once every agent is closed
-  and idle for ~10 minutes the daemon exits again. This is what catches
-  agents that never fire a hook (the Codex/ChatGPT app, Gemini, opencode,
-  ...); hooked agents (Claude Code, Cursor, Codex notify) start the
-  daemon instantly, hook-less ones within one trigger interval
-- optional `openrgb-python` package
-
-`python installer.py --no-autostart` skips the trigger task: the daemon
-then starts only when an agent hook fires — but hook-less agents are only
-detected while the daemon happens to be up.
-
-Restart any open Claude Code sessions afterwards so the hooks load.
-RGB keyboard? Also install [OpenRGB](https://openrgb.org) — the launcher
-auto-starts its SDK server and you get the full color scheme.
-
-**Uninstall:** `python installer.py --uninstall` (stops the daemon, removes
-the hooks and Codex wiring; restores the original notify program).
 
 ## Tuning
 
