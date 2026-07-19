@@ -1,4 +1,4 @@
-# Agent Keylight
+# EnLight
 
 Shows AI-agent status (Claude Code, Codex, any CLI agent) on your keyboard's
 lights. Works on Windows and macOS (**macOS support is untested** — written
@@ -80,6 +80,29 @@ for "needs you now".
   `lightctl.py hook <state>` on UserPromptSubmit/PreToolUse (running),
   PermissionRequest/Notification (waiting), Stop (stopped),
   StopFailure (error), SessionEnd (clear).
+- Cursor IDE hooks (in `~/.cursor/hooks.json`) do the same for Cursor's
+  native agent: beforeSubmitPrompt/afterFileEdit (running), stop (stopped).
+- `watchers.py` — hook-less detection for everything else. Most agents
+  stream their transcript/log to disk while they work, so a fresh write
+  means running; for native-binary CLIs a busy process (CPU) also counts.
+  When activity ends the tool shows stopped while its process is alive,
+  then the light is released. Built-in: **Codex CLI and the Codex/ChatGPT
+  desktop app** (both write `~/.codex/sessions` rollouts), **Gemini CLI**
+  (`~/.gemini/tmp`), **Copilot CLI**, **opencode**, **cursor-agent**,
+  **hermes**. Add your own tools in config.json:
+
+  ```json
+  { "watch": { "mytool": ["mytool-process-name"] } }
+  ```
+
+  (CPU-based detection of those process names.) Watcher states generally
+  can't distinguish "waiting for permission" — that still needs hooks.
+  Exception: the Codex/ChatGPT desktop app's `request_permissions` dialog
+  is detected directly from the rollout JSONL (an unresolved function-call
+  of that name), since Codex's `notify` hook never fires for it.
+- Each state file also records the agent's process id, so closing the
+  IDE/terminal without a clean exit (no SessionEnd) still turns the light
+  off: the daemon drops any session whose owner process is gone.
 - `codex_notify_chain.py` — Codex `notify` handler that marks turns stopped
   AND forwards to whatever notify program was configured before
   (edit `codex_notify_chain.json` if the Codex runtime path changes).
@@ -94,24 +117,36 @@ for "needs you now".
    without winget it opens python.org and asks you to re-run).
    **macOS:** run `./install.sh` in Terminal, then grant **Input
    Monitoring** to Python/Terminal if the light stays dark
-   (System Settings → Privacy & Security). Auto-start uses a launchd
-   agent instead of the Startup folder.
+   (System Settings → Privacy & Security).
 
 The installer does all the wiring automatically:
-- Startup entry (daemon runs at every logon)
 - Claude Code hooks merged into `~/.claude/settings.json`
   (existing settings untouched, backup written first; re-running the
   installer is safe and also fixes paths after moving the folder)
 - Codex `notify` chained in `~/.codex/config.toml`, preserving whatever
-  notify program was already configured
-- optional `openrgb-python` package, then starts the daemon
+  notify program was already configured. The Codex app sometimes rewrites
+  its config and drops the chain; the daemon detects this and re-chains
+  automatically (within ~5 minutes of any agent activity)
+- Cursor hooks merged into `~/.cursor/hooks.json` (if Cursor is installed)
+- a periodic trigger task (Task Scheduler / launchd, every 2 min,
+  invisible `pythonw`) that starts the daemon only while an agent app is
+  actually open — nothing runs at boot, and once every agent is closed
+  and idle for ~10 minutes the daemon exits again. This is what catches
+  agents that never fire a hook (the Codex/ChatGPT app, Gemini, opencode,
+  ...); hooked agents (Claude Code, Cursor, Codex notify) start the
+  daemon instantly, hook-less ones within one trigger interval
+- optional `openrgb-python` package
+
+`python installer.py --no-autostart` skips the trigger task: the daemon
+then starts only when an agent hook fires — but hook-less agents are only
+detected while the daemon happens to be up.
 
 Restart any open Claude Code sessions afterwards so the hooks load.
 RGB keyboard? Also install [OpenRGB](https://openrgb.org) — the launcher
 auto-starts its SDK server and you get the full color scheme.
 
-**Uninstall:** `python installer.py --uninstall` (removes the startup entry,
-hooks, and Codex wiring; restores the original notify program).
+**Uninstall:** `python installer.py --uninstall` (stops the daemon, removes
+the hooks and Codex wiring; restores the original notify program).
 
 ## Tuning
 
@@ -129,8 +164,15 @@ Manual test: `python lightctl.py running test` → watch the light →
 - Caps Lock **key still works normally**; only its LED is borrowed. If you
   toggle caps while the daemon owns the LED, the LED shows the pattern, not
   your caps state, until the agent goes idle.
-- Codex only reports "turn ended" (blip pattern); it can't signal "running"
-  unless launched through `agent-run.cmd`.
+- Watcher-detected agents (Gemini, opencode, ...) show running/stopped
+  only; "waiting for permission" needs hooks (Claude Code, Cursor) or,
+  for the Codex/ChatGPT desktop app, its `request_permissions` dialog
+  (detected from the rollout JSONL). For node/python-hosted CLIs (Gemini,
+  Copilot) the process can't be identified, so their stopped light times
+  out after 15 minutes instead of clearing when the tool closes.
+- VS Code's built-in Copilot agent exposes no external signal and isn't
+  detectable; agents used *inside* VS Code that have their own wiring
+  (Claude Code, Codex, Gemini CLI in a terminal) still work.
 - The "error" state comes from Claude Code's StopFailure hook (abnormal turn
   end), `agent-run.cmd` exit codes, or a manual `lightctl.py error <id>`.
   In-conversation problems (a failing test, a tool error mid-turn) count as

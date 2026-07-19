@@ -1,18 +1,24 @@
 """One-shot installer for Agent Keylight (Windows + macOS).
 
-    python installer.py               install / repair / update paths
-    python installer.py --uninstall   remove everything it added
+    python installer.py                  install / repair / update paths
+    python installer.py --no-autostart   install without the login autostart
+    python installer.py --uninstall      remove everything it added
 
 Does all the wiring a user would otherwise do by hand:
   1. default config.json (choose your two lights there afterwards)
   2. optional openrgb-python package (RGB keyboards)
-  3. auto-start at login (Windows: Startup folder / macOS: launchd agent)
-  4. Claude Code hooks merged into ~/.claude/settings.json (backed up first;
+  3. Claude Code hooks merged into ~/.claude/settings.json (backed up first;
      re-running is safe -- old keylight entries are replaced, nothing else
      is touched)
-  5. Codex notify wiring in ~/.codex/config.toml, preserving any existing
+  4. Codex notify wiring in ~/.codex/config.toml, preserving any existing
      notify program by chaining to it (backed up first)
-  6. (re)starts the daemon
+  5. Cursor IDE hooks merged into ~/.cursor/hooks.json (if Cursor exists)
+  6. a periodic trigger task (every 2 min, invisible) that starts the
+     daemon only while an agent app is actually open, so hook-less agents
+     (the Codex/ChatGPT app, Gemini, opencode, ...) get detected without
+     anything running at boot or while no agent is around -- skip it with
+     --no-autostart, then the daemon only starts on demand (first agent
+     hook) and exits when idle
 
 Everything uses this folder's current location, so users can copy the
 folder anywhere before running.
@@ -34,14 +40,18 @@ PY_CMD = "python" if IS_WIN else "python3"
 
 CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
 CODEX_CONFIG = Path.home() / ".codex" / "config.toml"
+CURSOR_DIR = Path.home() / ".cursor"
+CURSOR_HOOKS = CURSOR_DIR / "hooks.json"
 
-# Windows autostart
+# Windows: legacy login-autostart location (older versions; now removed)
 STARTUP_DIR = Path(os.environ.get("APPDATA", "")) / (
     "Microsoft/Windows/Start Menu/Programs/Startup"
 )
 STARTUP_CMD = STARTUP_DIR / "agent-keylight.cmd"
+# Windows: periodic trigger task (starts the daemon only while agents run)
+TASK_NAME = "AgentKeylightTrigger"
 
-# macOS autostart
+# macOS trigger / legacy autostart
 LAUNCHD_LABEL = "com.agent-keylight.daemon"
 LAUNCHD_PLIST = Path.home() / "Library/LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
 
@@ -86,48 +96,62 @@ def pip_openrgb():
         else "openrgb-python skipped (optional, RGB keyboards only)")
 
 
-def install_autostart():
+def install_trigger():
+    """Periodic trigger (every 2 min, invisible): starts the daemon only
+    while an agent app is actually open -- nothing runs at boot and the
+    daemon exits again once every agent is gone. Covers agents that never
+    fire a hook (Codex/ChatGPT app, Gemini, opencode, ...)."""
     if IS_WIN:
-        STARTUP_DIR.mkdir(parents=True, exist_ok=True)
-        STARTUP_CMD.write_text(
-            f'@echo off\r\ncall "{HERE}\\launcher.cmd"\r\n', encoding="ascii"
+        pythonw = Path(sys.executable).with_name("pythonw.exe")
+        exe = str(pythonw) if pythonw.exists() else sys.executable
+        r = subprocess.run(
+            ["schtasks", "/Create", "/F", "/TN", TASK_NAME,
+             "/SC", "MINUTE", "/MO", "2",
+             "/TR", f'"{exe}" "{HERE}\\trigger.py"'],
+            capture_output=True, text=True,
         )
-        log(f"startup entry: {STARTUP_CMD}")
+        if r.returncode == 0:
+            log("trigger task installed (daemon starts when an agent opens)")
+        else:
+            log(f"SKIPPED trigger task: {r.stderr.strip() or r.stdout.strip()}")
     elif IS_MAC:
         LAUNCHD_PLIST.parent.mkdir(parents=True, exist_ok=True)
         LAUNCHD_PLIST.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
+<plist version="1.0"><dict>
   <key>Label</key><string>{LAUNCHD_LABEL}</string>
   <key>ProgramArguments</key>
-  <array>
-    <string>{sys.executable}</string>
-    <string>{HERE}/daemon.py</string>
-  </array>
-  <key>WorkingDirectory</key><string>{HERE}</string>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><false/>
-</dict>
-</plist>
+  <array><string>{sys.executable}</string><string>{HERE}/trigger.py</string></array>
+  <key>StartInterval</key><integer>120</integer>
+</dict></plist>
 """, encoding="utf-8")
         subprocess.run(["launchctl", "unload", str(LAUNCHD_PLIST)],
                        capture_output=True)
         subprocess.run(["launchctl", "load", str(LAUNCHD_PLIST)],
                        capture_output=True)
-        log(f"launchd agent: {LAUNCHD_PLIST}")
+        log("trigger installed (daemon starts when an agent opens)")
 
 
-def remove_autostart():
-    if IS_WIN and STARTUP_CMD.exists():
-        STARTUP_CMD.unlink()
-        log("startup entry removed")
+def remove_trigger():
+    """Also cleans up the login autostart older versions installed.
+    Without the trigger the daemon is started on demand by lightctl.py
+    hooks only (hook-less agents then go undetected while it is down)."""
+    if IS_WIN:
+        r = subprocess.run(
+            ["schtasks", "/Delete", "/F", "/TN", TASK_NAME],
+            capture_output=True,
+        )
+        if r.returncode == 0:
+            log("trigger task removed")
+        if STARTUP_CMD.exists():
+            STARTUP_CMD.unlink()
+            log("startup entry removed")
     if IS_MAC and LAUNCHD_PLIST.exists():
         subprocess.run(["launchctl", "unload", str(LAUNCHD_PLIST)],
                        capture_output=True)
         LAUNCHD_PLIST.unlink()
-        log("launchd agent removed")
+        log("launchd trigger removed")
 
 
 def _strip_keylight_hooks(hooks):
@@ -190,6 +214,69 @@ def remove_claude_hooks():
         log("Claude Code hooks removed")
 
 
+# Cursor IDE hooks (~/.cursor/hooks.json): its native agent has no other
+# external status signal. Events picked so an absent reply never blocks
+# the agent (observability events default to allow/continue).
+CURSOR_EVENTS = {
+    "beforeSubmitPrompt": "running",
+    "afterFileEdit": "running",
+    "stop": "stopped",
+}
+
+
+def _strip_cursor_hooks(hooks):
+    for event in list(hooks):
+        entries = hooks[event]
+        if not isinstance(entries, list):
+            continue
+        hooks[event] = [
+            e for e in entries
+            if "lightctl.py" not in str(e.get("command", ""))
+        ]
+        if not hooks[event]:
+            del hooks[event]
+
+
+def install_cursor_hooks():
+    if not CURSOR_DIR.exists():
+        log("Cursor not found -- skipped (optional)")
+        return
+    data = {}
+    if CURSOR_HOOKS.exists():
+        try:
+            data = json.loads(CURSOR_HOOKS.read_text(encoding="utf-8"))
+        except ValueError:
+            log(f"SKIPPED Cursor hooks: {CURSOR_HOOKS} is not valid JSON")
+            return
+        backup(CURSOR_HOOKS)
+    data.setdefault("version", 1)
+    hooks = data.setdefault("hooks", {})
+    _strip_cursor_hooks(hooks)  # replace any previous install (moved folder)
+    for event, state in CURSOR_EVENTS.items():
+        hooks.setdefault(event, []).append({
+            "command": f"{PY_CMD} {HERE_FWD}/lightctl.py hook {state}"
+        })
+    CURSOR_HOOKS.write_text(
+        json.dumps(data, indent=2) + "\n", encoding="utf-8"
+    )
+    log("Cursor hooks installed (~/.cursor/hooks.json)")
+
+
+def remove_cursor_hooks():
+    if not CURSOR_HOOKS.exists():
+        return
+    try:
+        data = json.loads(CURSOR_HOOKS.read_text(encoding="utf-8"))
+    except ValueError:
+        return
+    if "hooks" in data:
+        _strip_cursor_hooks(data["hooks"])
+        CURSOR_HOOKS.write_text(
+            json.dumps(data, indent=2) + "\n", encoding="utf-8"
+        )
+        log("Cursor hooks removed")
+
+
 NOTIFY_RE = re.compile(r"^notify\s*=\s*(\[.*\])\s*$", re.MULTILINE)
 
 
@@ -200,9 +287,14 @@ def install_codex_notify():
     text = CODEX_CONFIG.read_text(encoding="utf-8")
     ours = (f'notify = [{json.dumps(PY_CMD)}, '
             f'{json.dumps(str(HERE / "codex_notify_chain.py"))}]')
+    # NOTE: replacements go through a lambda so re.sub does not treat the
+    # backslashes in Windows paths as escape sequences (halving them would
+    # write invalid TOML, which Codex then drops on its next config rewrite)
     if "codex_notify_chain.py" in text:
-        CODEX_CONFIG.write_text(NOTIFY_RE.sub(ours, text), encoding="utf-8")
-        log("Codex notify already chained (path refreshed)")
+        new = NOTIFY_RE.sub(lambda _: ours, text)
+        if new != text:  # only touch the file when the path actually moved
+            CODEX_CONFIG.write_text(new, encoding="utf-8")
+        log("Codex notify already chained")
         return
     backup(CODEX_CONFIG)
     m = NOTIFY_RE.search(text)
@@ -215,7 +307,7 @@ def install_codex_notify():
         (HERE / "codex_notify_chain.json").write_text(
             json.dumps({"forward": forward}, indent=2) + "\n", encoding="utf-8"
         )
-        text = NOTIFY_RE.sub(ours, text, count=1)
+        text = NOTIFY_RE.sub(lambda _: ours, text, count=1)
     else:
         (HERE / "codex_notify_chain.json").write_text(
             json.dumps({"forward": []}, indent=2) + "\n", encoding="utf-8"
@@ -226,24 +318,25 @@ def install_codex_notify():
 
 
 def remove_codex_notify():
-    if not CODEX_CONFIG.exists():
-        return
-    text = CODEX_CONFIG.read_text(encoding="utf-8")
-    if "codex_notify_chain.py" not in text:
-        return
-    try:
-        forward = json.loads(
-            (HERE / "codex_notify_chain.json").read_text(encoding="utf-8")
-        ).get("forward") or []
-    except (OSError, ValueError):
-        forward = []
-    if forward:
-        arr = "[ " + ", ".join(json.dumps(x) for x in forward) + " ]"
-        text = NOTIFY_RE.sub(f"notify = {arr}", text, count=1)
-    else:
-        text = NOTIFY_RE.sub("", text, count=1)
-    CODEX_CONFIG.write_text(text, encoding="utf-8")
-    log("Codex notify restored")
+    chain_json = HERE / "codex_notify_chain.json"
+    text = (CODEX_CONFIG.read_text(encoding="utf-8")
+            if CODEX_CONFIG.exists() else "")
+    if "codex_notify_chain.py" in text:
+        try:
+            forward = json.loads(
+                chain_json.read_text(encoding="utf-8")
+            ).get("forward") or []
+        except (OSError, ValueError):
+            forward = []
+        if forward:
+            arr = "[ " + ", ".join(json.dumps(x) for x in forward) + " ]"
+            text = NOTIFY_RE.sub(lambda _: f"notify = {arr}", text, count=1)
+        else:
+            text = NOTIFY_RE.sub("", text, count=1)
+        CODEX_CONFIG.write_text(text, encoding="utf-8")
+        log("Codex notify restored")
+    # without this file the daemon knows not to re-chain (see daemon.py)
+    chain_json.unlink(missing_ok=True)
 
 
 def stop_daemon():
@@ -290,20 +383,35 @@ def main():
     if "--uninstall" in sys.argv:
         print("Uninstalling Agent Keylight...")
         stop_daemon()
-        remove_autostart()
+        remove_trigger()
         remove_claude_hooks()
         remove_codex_notify()
+        remove_cursor_hooks()
         print("Done. (State folder left in place.)")
         return 0
 
     print("Installing Agent Keylight...")
     ensure_config()
     pip_openrgb()
-    install_autostart()
     install_claude_hooks()
     install_codex_notify()
-    stop_daemon()   # restart so a re-install picks up new code
-    start_daemon()
+    install_cursor_hooks()
+    stop_daemon()   # so a re-install picks up new code
+    from config import BASE_DIR
+    if IS_WIN and STARTUP_CMD.exists():
+        STARTUP_CMD.unlink()  # login autostart from older versions
+        log("old login autostart removed")
+    if "--no-autostart" in sys.argv:
+        remove_trigger()
+    else:
+        install_trigger()
+    # bring the daemon up now if an agent is already active
+    import watchers
+    if (any((BASE_DIR / "sessions").glob("*.state"))
+            or watchers.poll() or watchers.procs_alive()):
+        start_daemon()
+    else:
+        log("daemon starts when the next agent runs")
     print("Done! Restart any open Claude Code sessions to activate the hooks.")
     if IS_MAC:
         print("macOS: grant Input Monitoring to Python/Terminal if the light")
