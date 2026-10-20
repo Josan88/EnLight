@@ -209,6 +209,62 @@ class CodexTool(Tool):
         return state
 
 
+# Copilot sessions started by these clients aren't the user's own: Hermes
+# spawns `copilot --acp` for a split second to list models (and drives any
+# real turns through its own hooks), which would otherwise read as activity.
+COPILOT_IGNORED_CLIENTS = {"hermes-agent"}
+
+
+class CopilotTool(Tool):
+    """Copilot CLI activity from conversation transcripts only.
+
+    Every Copilot launch writes logs/*.log, including other apps' short
+    ACP probes, so logs are ignored; a real conversation appends to
+    session-state/<id>/events.jsonl, whose sibling workspace.yaml names
+    the client that started it.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._clients = {}  # session dir -> client_name
+
+    def _client(self, session_dir):
+        if session_dir not in self._clients:
+            client = ""
+            try:
+                text = (session_dir / "workspace.yaml").read_text(
+                    encoding="utf-8", errors="ignore")
+                for line in text.splitlines():
+                    if line.startswith("client_name:"):
+                        client = line.split(":", 1)[1].strip()
+                        break
+            except OSError:
+                pass
+            self._clients[session_dir] = client
+        return self._clients[session_dir]
+
+    def _newest_mtime(self, now):
+        base = self.base() if callable(self.base) else Path(self.base)
+        newest = 0.0
+        for pat in self.patterns:
+            try:
+                hits = list(base.glob(pat))
+            except (OSError, ValueError):
+                continue
+            for f in hits:
+                try:
+                    m = f.stat().st_mtime
+                except OSError:
+                    continue
+                if m <= newest:
+                    continue
+                if (f.name == "events.jsonl"
+                        and self._client(f.parent) in COPILOT_IGNORED_CLIENTS):
+                    continue
+                newest = m
+        return min(newest, now)
+
+
 def _build():
     tools = [
         # Codex CLI and the Codex/ChatGPT desktop app both stream turn
@@ -219,8 +275,9 @@ def _build():
                   alive=("codex", "codex-tui", "codex-exec", "chatgpt")),
         # node-hosted (process is just node.exe): file activity only
         Tool("gemini", lambda: HOME / ".gemini", ("tmp/*/logs.json",)),
-        Tool("copilot", lambda: HOME / ".copilot",
-             ("history-session-state/*.json", "logs/*.log")),
+        CopilotTool("copilot", lambda: HOME / ".copilot",
+                    ("session-state/*/events.jsonl",
+                     "history-session-state/*.json")),
         # native binaries: CPU activity works
         Tool("opencode", lambda: HOME / ".local/share/opencode",
              ("log/*.log",), cpu=("opencode",)),
