@@ -226,8 +226,8 @@ def _build():
              ("log/*.log",), cpu=("opencode",)),
         Tool("cursor-agent", lambda: HOME / ".cursor",
              ("chats/*/*",), cpu=("cursor-agent",)),
-        # disabled: matches the Hermes app/CLI, which never goes idle
-        # Tool("hermes", cpu=("hermes",)),
+        # hermes: covered by its shell hooks (installer.py) instead -- its
+        # gateway/desktop processes are never idle, so CPU can't tell
     ]
     extra = load_config().get("watch") or {}
     for name, procs in extra.items():

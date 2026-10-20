@@ -13,7 +13,9 @@ Does all the wiring a user would otherwise do by hand:
   4. Codex notify wiring in ~/.codex/config.toml, preserving any existing
      notify program by chaining to it (backed up first)
   5. Cursor IDE hooks merged into ~/.cursor/hooks.json (if Cursor exists)
-  6. a periodic trigger task (every 2 min, invisible) that starts the
+  6. Hermes shell hooks in every profile's config.yaml under HERMES_HOME
+     (default ~/.hermes), pre-approved in each shell-hooks-allowlist.json
+  7. a periodic trigger task (every 2 min, invisible) that starts the
      daemon only while an agent app is actually open, so hook-less agents
      (the Codex/ChatGPT app, Gemini, opencode, ...) get detected without
      anything running at boot or while no agent is around -- skip it with
@@ -277,6 +279,98 @@ def remove_cursor_hooks():
         log("Cursor hooks removed")
 
 
+# Hermes shell hooks (`hooks:` in each profile's config.yaml). Hermes is
+# always busy in the background (gateway, cron, heartbeats), so watching
+# its CPU or logs can't tell a real turn apart -- hooks can. Each profile
+# is its own Hermes home with its own config and consent allowlist; the
+# desktop app and gateway can't show the first-use consent prompt, so the
+# allowlist entries are written here too.
+HERMES_HOME = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+HERMES_EVENTS = {
+    "pre_llm_call": "running",
+    "on_human_input_request": "waiting",   # approval / clarify / sudo
+    "on_human_input_resolved": "running",
+    "on_session_end": "clear",             # fires at every turn end
+}
+HERMES_BEGIN = "# >>> agent-keylight hooks (managed by EnLight installer.py)"
+HERMES_END = "# <<< agent-keylight hooks"
+HERMES_ALLOWLIST = "shell-hooks-allowlist.json"
+
+
+def _hermes_homes():
+    if not (HERMES_HOME / "config.yaml").exists():
+        return []
+    return [HERMES_HOME] + sorted(
+        p.parent for p in HERMES_HOME.glob("profiles/*/config.yaml"))
+
+
+def _hermes_cmd(state):
+    return f"{PY_CMD} {HERE_FWD}/lightctl.py hook {state}"
+
+
+def _strip_hermes_block(text):
+    start = text.find(HERMES_BEGIN)
+    if start < 0:
+        return text
+    end = text.find(HERMES_END, start)
+    end = len(text) if end < 0 else end + len(HERMES_END)
+    return (text[:start].rstrip("\n") + "\n" + text[end:].lstrip("\n")).lstrip("\n")
+
+
+def _update_hermes_allowlist(home, add):
+    path = home / HERMES_ALLOWLIST
+    data = {"approvals": []}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except ValueError:
+            return False
+    approvals = [e for e in data.get("approvals", [])
+                 if "lightctl.py" not in str(e.get("command", ""))]
+    if add:
+        approvals += [{"event": ev, "command": _hermes_cmd(st),
+                       "approved_at": None, "script_mtime_at_approval": None}
+                      for ev, st in HERMES_EVENTS.items()]
+    data["approvals"] = approvals
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8")
+    return True
+
+
+def install_hermes_hooks():
+    homes = _hermes_homes()
+    if not homes:
+        log("Hermes not found -- skipped (optional)")
+        return
+    block = HERMES_BEGIN + "\nhooks:\n" + "".join(
+        f"  {ev}:\n    - command: \"{_hermes_cmd(st)}\"\n      timeout: 10\n"
+        for ev, st in HERMES_EVENTS.items()) + HERMES_END + "\n"
+    done = 0
+    for home in homes:
+        cfg = home / "config.yaml"
+        text = _strip_hermes_block(cfg.read_text(encoding="utf-8"))
+        # no YAML parser in the stdlib: only add our block when the file
+        # has no hooks of its own, rather than risk mangling them
+        if re.search(r"^hooks\s*:", text, re.MULTILINE):
+            log(f"SKIPPED Hermes hooks: {cfg} already has a hooks: section")
+            continue
+        backup(cfg)
+        cfg.write_text(text.rstrip("\n") + "\n\n" + block, encoding="utf-8")
+        _update_hermes_allowlist(home, add=True)
+        done += 1
+    log(f"Hermes hooks installed ({done} profile(s) -- restart Hermes)")
+
+
+def remove_hermes_hooks():
+    for home in _hermes_homes():
+        cfg = home / "config.yaml"
+        text = cfg.read_text(encoding="utf-8")
+        if HERMES_BEGIN in text:
+            cfg.write_text(_strip_hermes_block(text), encoding="utf-8")
+            _update_hermes_allowlist(home, add=False)
+            log(f"Hermes hooks removed ({home.name})")
+
+
 NOTIFY_RE = re.compile(r"^notify\s*=\s*(\[.*\])\s*$", re.MULTILINE)
 
 
@@ -387,6 +481,7 @@ def main():
         remove_claude_hooks()
         remove_codex_notify()
         remove_cursor_hooks()
+        remove_hermes_hooks()
         print("Done. (State folder left in place.)")
         return 0
 
@@ -396,6 +491,7 @@ def main():
     install_claude_hooks()
     install_codex_notify()
     install_cursor_hooks()
+    install_hermes_hooks()
     stop_daemon()   # so a re-install picks up new code
     from config import BASE_DIR
     if IS_WIN and STARTUP_CMD.exists():

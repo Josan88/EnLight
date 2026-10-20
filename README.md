@@ -38,7 +38,7 @@ cd EnLight
 ./install.sh
 ```
 
-That's it — Claude Code, Codex, and Cursor get wired up automatically.
+That's it — Claude Code, Codex, Cursor, and Hermes get wired up automatically.
 Restart any open Claude Code sessions afterward so the hooks load.
 RGB keyboard? Also install [OpenRGB](https://openrgb.org) for full color
 support. macOS: grant **Input Monitoring** to Python/Terminal if the light
@@ -104,18 +104,24 @@ for "needs you now".
   `python lightctl.py running|waiting|stopped|error|clear [session-id]`
 - Claude Code hooks (in `~/.claude/settings.json`) call
   `lightctl.py hook <state>` on UserPromptSubmit/PreToolUse (running),
-  PermissionRequest/Notification (waiting), Stop (stopped),
+  PermissionRequest/Notification (waiting), Stop (clear),
   StopFailure (error), SessionEnd (clear).
 - Cursor IDE hooks (in `~/.cursor/hooks.json`) do the same for Cursor's
   native agent: beforeSubmitPrompt/afterFileEdit (running), stop (stopped).
+- Hermes shell hooks (a managed `hooks:` block in every profile's
+  `config.yaml` under `HERMES_HOME`, pre-approved in each
+  `shell-hooks-allowlist.json`): pre_llm_call (running),
+  on_human_input_request (waiting), on_human_input_resolved (running),
+  on_session_end (clear). Restart Hermes after installing. Profiles that
+  already have their own `hooks:` section are skipped.
 - `watchers.py` — hook-less detection for everything else. Most agents
   stream their transcript/log to disk while they work, so a fresh write
   means running; for native-binary CLIs a busy process (CPU) also counts.
   When activity ends the tool shows stopped while its process is alive,
   then the light is released. Built-in: **Codex CLI and the Codex/ChatGPT
   desktop app** (both write `~/.codex/sessions` rollouts), **Gemini CLI**
-  (`~/.gemini/tmp`), **Copilot CLI**, **opencode**, **cursor-agent**,
-  **hermes**. Add your own tools in config.json:
+  (`~/.gemini/tmp`), **Copilot CLI**, **opencode**, **cursor-agent**.
+  Add your own tools in config.json:
 
   ```json
   { "watch": { "mytool": ["mytool-process-name"] } }
