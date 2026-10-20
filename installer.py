@@ -60,7 +60,7 @@ HOOK_EVENTS = {
     "PreToolUse": "running",
     "PermissionRequest": "waiting",
     "Notification": "waiting",
-    "Stop": "stopped",
+    "Stop": "clear",  # go dark when a turn ends instead of double-blipping
     "StopFailure": "error",
     "SessionEnd": "clear",
 }
